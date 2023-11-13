@@ -8,29 +8,63 @@ import numpy as np
 import torch.nn.functional
 # from collections import defaultdict
 from torch.distributions import Normal
-
+import logging
+import wandb
+import os
+import datetime
 import sys
 sys.path.append("..")
 
 from model.blocks import BlockEncoder, AsFeatureMap_down, AsFeatureMap_up, BlockDecoder, BlockFinalImg, Upsample, BlockQ
 from model.utils import soft_clamp, soft_clamp_img, InitWeights_He, SEBlock3D
+from model.classifier import MLP
 
+def create_logger(folder):
+    """Create a logger to save logs."""
+    compt = 0
+    while os.path.exists(os.path.join(folder,f"logs_{compt}.txt")):
+        compt+=1
+    logname = os.path.join(folder,f"logs_{compt}.txt")
+    
+    logger = logging.getLogger()
+    fileHandler = logging.FileHandler(logname, mode="w")
+    consoleHandler = logging.StreamHandler()
+    logger.addHandler(fileHandler)
+    logger.addHandler(consoleHandler)
+
+    formatter = logging.Formatter("%(message)s")
+    fileHandler.setFormatter(formatter)
+    consoleHandler.setFormatter(formatter)
+    logger.setLevel(logging.INFO)
+    logger.addHandler(WandbHandler())
+
+    return logger 
+
+
+class WandbHandler(logging.Handler):
+    def emit(self, record):
+        msg = self.format(record)
+        wandb.run.log({record.levelname: msg})
+        
 
 class BIVA3D(nn.Module):
 
     def __init__(
         self, 
         stochastic_module,
+        resume,
+        root,
         base_num_features, 
         num_pool,
         expansion_factor=2,
         num_feat_img=1,
         init_weights=InitWeights_He,
         input_shape=(64,64,64),
-        max_features=64,
+        max_features=32,
         with_residual=True,
         with_se=True,
         logger=None,
+        classifier=MLP(4096),
         last_act='tanh'):
         """
 
@@ -44,10 +78,11 @@ class BIVA3D(nn.Module):
         self.max_features = max_features
         self.num_feat_img = num_feat_img
         self.num_pool = num_pool
-
-        self.logger = logger
-        # self.train_stage = 0
-
+        
+        self.classifier = classifier
+        
+        self.resume = resume
+        
         self.last_act = last_act
         self.with_residual = with_residual
         self.with_se = with_se
@@ -57,7 +92,33 @@ class BIVA3D(nn.Module):
         self.expansion_factor = expansion_factor
 
         self.build_init()
+        
+        
+        if self.resume:
+            self.root = root
+            # Create a directory with the timestamp
+            save_dir = os.path.join(self.root, "models")
+            os.makedirs(save_dir, exist_ok=True)  # Create the directory if it doesn't exist
 
+            log_dir = os.path.join(self.root, "logs")
+            os.makedirs(log_dir, exist_ok=True)  # Create the directory if it doesn't exist            
+            
+        else:
+            current_time = datetime.datetime.now()
+            timestamp = current_time.strftime("%Y-%m-%d_%H-%M-%S")
+            self.root = os.path.join("/root/code/pg_hvae/runs",timestamp)
+
+            # Create a directory with the timestamp
+            save_dir = os.path.join(self.root, "models")
+            os.makedirs(save_dir, exist_ok=True)  # Create the directory if it doesn't exist
+
+            log_dir = os.path.join(self.root, "logs")
+            os.makedirs(log_dir, exist_ok=True)  # Create the directory if it doesn't exist
+
+        self.save_dir = save_dir
+        self.logger = create_logger(log_dir)
+
+        
     def build_init(self):
 
         # min_shape = [int(k/(2**self.num_pool)) for k in self.original_shape] # Define shape of the smallest feature volume
@@ -95,9 +156,9 @@ class BIVA3D(nn.Module):
         self.conv_blocks.append(BlockEncoder(nfeat_output, nfeat_output, residual=self.with_residual, with_se=self.with_se))
 
         # Going from a feature volume to a feature vector (e.g (3,3,3)-->(1))
-        self.bottleneck_down = AsFeatureMap_down(input_shape=[nfeat_output,]+min_shape, target_dim=4*self.max_features)
+        self.bottleneck_down = AsFeatureMap_down(input_shape=[nfeat_output,]+min_shape, target_dim=2*self.max_features)
         # Going from a feature vector to a feature volume (e.g. (1)-->(3,3,3)) 
-        self.bottleneck_up = AsFeatureMap_up(input_dim=2*self.max_features, target_shape=[self.max_features,]+min_shape)
+        self.bottleneck_up = AsFeatureMap_up(input_dim=1*self.max_features, target_shape=[self.max_features,]+min_shape)
 
         # Layers for the approximate posterior + prior
         nfeat_latent = self.max_features
@@ -180,7 +241,7 @@ class BIVA3D(nn.Module):
         return Normal(mu, temp*sigma)
         
 
-    def forward(self, x, temp=1, return_feat=False, verbose=False):
+    def forward(self, x, temp=1, return_feat=False, return_z=True, verbose=False):
         
         # Create embeddings for injecting info from (x_i)
         x, skips = self.create_encodings(x)
@@ -254,7 +315,7 @@ class BIVA3D(nn.Module):
             logvar_zi_q_res = soft_clamp(logvar_zi_q_res)
             res_params[z_name] = {'loc':mu_zi_q_res, 'logscale_res': logvar_zi_q_res}
             distribs[z_name]['marginal'] = self.compute_marginal(mu_zi_q_res, logvar_zi_q_res, mu_zi_p, torch.exp(-logvar_zi_p), temp) 
-            
+
             # Approximate posterior for q(z_{l-1}|x_{\pi}, z_l) = p(z_{l-1}|z_l) \prod_{i\in\pi} q(z_{l-1}|x_i,z_l)
             distribs[z_name]['full'] = self.compute_full(res_params[z_name], distribs[z_name]['prior'], temp)
         
@@ -272,11 +333,82 @@ class BIVA3D(nn.Module):
 
         if return_feat:
             return  output_img, kls, z_full['z1']
+        elif return_z:
+            return output_img, kls, z_full['z{}'.format(self.nb_latent)]
         else:
             return  output_img, kls        
     
 
     def sample(self, batch_size, temp=0.7):
+        
+        # Prior distribution for z_L
+        mu = torch.zeros((batch_size,self.max_features)).cuda()
+        sigma = torch.ones((batch_size,self.max_features)).cuda()
+
+        p_zl = Normal(mu, temp*sigma) # define prior to z_L
+        
+        # Sample from p(z_L)
+        zl_p = p_zl.sample() # prior sample
+        zl_p_up = self.bottleneck_up(zl_p) # 
+
+        z_full = {'z{}'.format(self.nb_latent):zl_p_up} # dict of latent variables from prior
+
+        for i in range(self.nb_latent - 1):
+            z_name = 'z{}'.format(self.nb_latent-(i+1))
+            
+            # Creating feature volume for z_{l-1}
+            z_ip1 = z_full['z{}'.format(self.nb_latent-i)]
+            x = self.tu[i](z_ip1)
+            x = self.conv_blocks_localization[i](x)
+
+            # Prior p(z_{l-1}|z_l)
+            mu_zi_p, logvar_zi_p = self.pz[i](x).chunk(2, dim=1)
+            mu_zi_p = soft_clamp(mu_zi_p)
+            logvar_zi_p = soft_clamp(logvar_zi_p)
+            var_zi_p = torch.exp(logvar_zi_p)
+            p_zi =  Normal(mu_zi_p, temp*var_zi_p)
+            
+            # Sampling z_{l-1}
+            zi_p = p_zi.sample()
+            z_full[z_name] = zi_p
+
+        # if self.return_cat:
+        #     return torch.cat([fblock(z_full['z1']) for fblock in self.final_blocks], 1)
+        # else:
+        return self.final_blocks(z_full['z1'])
+
+    def dir_sample(self, shape):
+        alphas = torch.full((shape), self.dir_alphas).double().cuda() # sparse prior
+        p_zl = Dirichlet(alphas, validate_args=True)
+
+        zl_p = p_zl.sample()
+        zl_p_up = self.bottleneck_up(zl_p)
+        z_full = {'z{}'.format(self.nb_latent):zl_p_up} # dict of latent variables from prior
+
+        for i in range(self.nb_latent - 1):
+            z_name = 'z{}'.format(self.nb_latent-(i+1))
+            
+            # Creating feature volume for z_{l-1}
+            z_ip1 = z_full['z{}'.format(self.nb_latent-i)]
+            x = self.tu[i](z_ip1)
+            x = self.conv_blocks_localization[i](x)
+
+            # Prior p(z_{l-1}|z_l)
+            alphas_zi_p = self.pz[i](x)
+            alphas_zi_p = F.softplus(alphas_zi_p) + 1e-10
+
+            p_zi =  Dirichlet(alphas_zi_p) 
+            
+            # Sampling z_{l-1}
+            zi_p = p_zi.sample()
+            z_full[z_name] = zi_p
+
+        # if self.return_cat:
+        #     return torch.cat([fblock(z_full['z1']) for fblock in self.final_blocks], 1)
+        # else:
+        return self.final_blocks(z_full['z1'])
+
+    def gau_sample(self, batch_size, temp=0.7):
         
         # Prior distribution for z_L
         mu = torch.zeros((batch_size,2*self.max_features)).cuda()
@@ -314,13 +446,14 @@ class BIVA3D(nn.Module):
         # else:
         return self.final_blocks(z_full['z1'])
 
-    def model_save(self, path):
-        path = f"{path}/model{self.train_stage}.pth"
+    def model_save(self, train_stage):
+        path = f"{self.save_dir}/model{train_stage}.pth"
         torch.save(self.state_dict(), path)
 
-    def model_load(self, path):
-        path = f"{path}/model{self.train_stage - 1}.pth"
-        self.load_state_dict(torch.load(path))
+    def model_load(self, stage):
+        # path = f"{path}/model{self.train_stage - 1}.pth"
+        full_path = f"{self.save_dir}/model{stage}-klweight-4.pth"
+        self.load_state_dict(torch.load(full_path))
     
     def find_input_dims(self):
         params = list(self.named_parameters())
@@ -335,7 +468,7 @@ class BIVA3D(nn.Module):
             param.requires_grad = False
             
 
-    def add_layers(self, stage):
+    def add_layers(self):
         
         min_shape = [int(k/(2**self.num_pool)) for k in self.current_img_dims] # Define shape of the smallest feature volume
 
@@ -418,10 +551,18 @@ class BIVA3D(nn.Module):
         print(f"Current image dimensions: {self.current_img_dims}")
         print(f"Expansion factor: {self.expansion_factor}")
         print(f"New image dimensions: {self.new_img_dims}")
-        self.add_layers(stage)
+        
+        # Load weights into the previous stage
+        
+        previous_path = f"{self.save_dir}/model{stage-1}.pth"
+        prev_model = torch.load(previous_path)
+        self.load_state_dict(prev_model)
+        
+        self.add_layers()
         
         self.current_img_dims = self.new_img_dims
         
+               
         
 
 if __name__ == "__main__":
@@ -435,7 +576,6 @@ if __name__ == "__main__":
     model.grow(2)
     x = torch.randn(1, 1, 64, 64, 64)
     output_img, kls = model(x)
-    print(output_img.shape)
     
     print("============")
    
