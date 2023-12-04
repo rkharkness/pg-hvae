@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import glob 
 import matplotlib.pyplot as plt
+# torch.set_default_dtype(torch.float16)
 
 def split_data(df):
     
@@ -38,8 +39,8 @@ def split_data(df):
     
     return df
 
-def get_dataloader(x, id_, train, batch_size, sample_weight, num_workers=64):
-    dataset = trainset_io(x, id_, train=train)
+def get_dataloader(x, id_, train, batch_size, sample_weight, img_size=(64,64,64), num_workers=64):
+    dataset = trainset_io(x, id_, img_size, train=train)
    
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=True, drop_last=True)
     return dataloader
@@ -48,18 +49,21 @@ def collect_paths(root):
     paths = [glob.glob(root+f"/subset{i}/*mhd") for i in range (10)]
     return paths
     
-def trainset_io(X, ID, train=True):
+def trainset_io(X, ID, img_size, train=True):
     """
     To create a 3D train dataset with TorchIO library
     Intensity rescaling between [0,1] for the CT air and bone HU values
     """
-    HOUNSFIELD_AIR, HOUNSFIELD_BONE = -1000, -700
+    # sample_dict = {32 * i: tuple(x / (2 ** i) for x in (10.8, 12, 10.8)) for i in range(30)}
+    sample_dict = {64:(5.4,6.,5.4), 96:(4.,4.5,4.), 128: (2.7,3,2.7), 192:(2.4,2.8,2.4), 256:(1.3,1.5,1.3), 512:(0.65,0.75,0.65), 1024:(0.65,0.75,0.65)}
+    resample_vals = sample_dict[img_size[0]]
+    HOUNSFIELD_AIR, HOUNSFIELD_BONE = -1024, 800
     transform = tio.Compose([
           tio.transforms.Clamp(out_min=HOUNSFIELD_AIR, out_max=HOUNSFIELD_BONE),
           tio.transforms.ToCanonical(),
           tio.CopyAffine('ct'),
-          tio.transforms.Resample((5.5,6.,5.5)), # spacing of scans after spacing unification
-          tio.transforms.CropOrPad((64, 64, 64)), #(480, 480, 280)),
+          tio.transforms.Resample(resample_vals), # spacing of scans after spacing unification
+          tio.transforms.CropOrPad(img_size), #(480, 480, 280)),
           # tio.Mask(masking_method='lungs'),
           tio.transforms.RescaleIntensity(out_min_max = [0,1]), 
     ]) 
@@ -98,11 +102,10 @@ if __name__ == "__main__":
 
     x_val = val_data['path'].values[:3]
     id_val = val_data['seriesuid'].values[:3]
-
     
     BATCHSIZE=1
-    train_loader = get_dataloader(x_train, id_train, train=True, batch_size=BATCHSIZE, sample_weight=None, num_workers=4)
-    val_loader = get_dataloader(x_val, id_val, train=True, batch_size=BATCHSIZE, sample_weight=None, num_workers=4)
+    train_loader = get_dataloader(x_train, id_train, train=True, batch_size=BATCHSIZE, img_size=(256,256,256), sample_weight=None, num_workers=4)
+    val_loader = get_dataloader(x_val, id_val, train=True, batch_size=BATCHSIZE, img_size=(256,256,256), sample_weight=None, num_workers=4)
 
     image_data = next(iter(val_loader))
     
@@ -115,13 +118,12 @@ if __name__ == "__main__":
     
     x = np.squeeze(x)
     
-
-    plt.figure(figsize=(28,32))
+    plt.figure(figsize=(42,48))
     plt.gray()
     plt.subplots_adjust(0,0,1,0.95,0.01,0.01)
     for i in range(x.shape[0]):
         x_i = np.expand_dims(x[:,:,i],-1)
-        plt.subplot(16,10,i+1), plt.imshow(x_i), plt.axis('off')
+        plt.subplot((x.shape[0]//10)+1,10,i+1), plt.imshow(x_i), plt.axis('off')
     plt.suptitle('Lung CT-scan mha (raw) files', size=15)
     plt.savefig("./batch.png")
     plt.show()
