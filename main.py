@@ -1,6 +1,6 @@
 from model.biva import BIVA3D
 from model.classifier import MLP
-from data.luna16 import split_data, get_dataloader, collect_paths
+from data.luna16 import split_data, get_dataloader, collect_paths, create_sampler
 
 from sklearn.model_selection import train_test_split
 import pandas as pd
@@ -23,12 +23,13 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--model_dir", type=str, default="/root/code/pg_hvae", help="Path to the output file")
     parser.add_argument("--dirichlet", type=bool, default=True)
-    parser.add_argument("--dir_conc", type=float, default=0.5)
+    parser.add_argument("--dir_conc", type=float, default=0.8)
     parser.add_argument("--beta", type=int, default=1)
-    parser.add_argument("--kl_weight", type=int, default=1e-3)
-    parser.add_argument("--bce_weight", type=int, default=5e-3)
+    parser.add_argument("--kl_weight", type=int, default=1e-9)
+    parser.add_argument("--bce_weight", type=int, default=1)
     parser.add_argument("--device", type=str, default='cuda')
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--pc_grad", type=bool, default=False)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--base_num_features", type=int, default=4)
     parser.add_argument("--max_features", type=int, default=12)
@@ -55,9 +56,9 @@ if __name__ == "__main__":
         "bce_weight":args.bce_weight,
         "base_num_features":args.base_num_features,
         "max_features":args.max_features,
-        "dirichlet":args.dirichlet
+        "dirichlet":args.dirichlet,
+        "pc_grad":args.pc_grad
                       })
-    # wandb.config.update({"backbone_type": "resnet", "channels": 16})
     
     pathlist = collect_paths("/root/data/luna16")
     pathlist = [i for paths in pathlist for i in paths]
@@ -77,7 +78,9 @@ if __name__ == "__main__":
     data = split_data(data)
 
     train_data = data[data['split']=='train'].reset_index(drop=True)
+    print(train_data['class'].value_counts())
     val_data = data[data['split']=='val'].reset_index(drop=True)
+    print(val_data['class'].value_counts())
 
     x_train = train_data['path'].values
     id_train = train_data['seriesuid'].values
@@ -93,25 +96,40 @@ if __name__ == "__main__":
     model = BIVA3D(stochastic_module=None, dirichlet=args.dirichlet, dir_conc=args.dir_conc, resume=args.resume, root=args.resume_dir,input_shape=(res,res,res), base_num_features=args.base_num_features, max_features=args.max_features, num_pool=4)
     model.cuda()
     
+    if args.resume_stage != None:
+        if args.resume_stage > 1:
+            assert args.resume, "Must indicate resuming if trying to start with a later stages"
+    
     if args.resume:
-        start_stage = args.resume_stage        
+        start_stage = args.resume_stage
+        assert args.resume_stage != None, "Must define training stage if resuming"
     else:
         start_stage = 1
+    
+    max_save_stage = 0
+
+    if args.resume_dir != None:
+        files = os.listdir(args.resume_dir + "/models")
+        if len(files) > 0:
+            saved_stages = list(filter(str.isdigit, str(files)))
+            max_save_stage = max([int(i) for i in saved_stages])
+
         
     for pg_stage in range(start_stage,6):
         
         if start_stage > 1: # Resuming
-            extra_stages = start_stage - 1 #1
-            # load_stage = start_stage - extra_stages #1
-            while extra_stages > 0: # Grow to the previous stage for resume
+            extra_stages = start_stage - 1  
+            while extra_stages >= 1: # Grow to the previous stage for resume
                 load_stage = (start_stage - extra_stages) + 1 # 1
                 model.grow(load_stage)
                 res = res*2
                 extra_stages-=1
-                start_stage += 1
-                
-            # Load weight for if resuming same resolution stage
-            model.model_load(start_stage)
+            
+            if max_save_stage == args.resume_stage:
+                # Load weight for if resuming same resolution stage
+                print("loading weight for same stage")
+                model = model.model_load(start_stage)
+            
             model.cuda()
             
         
@@ -123,9 +141,12 @@ if __name__ == "__main__":
         all_ = [p for p in model.parameters()]
         print(f"training {len(params)} / {len(all_)} params")
         
+        train_sampler = create_sampler(train_data, class_weights=[2.2,1])                                    
+        val_sampler = create_sampler(val_data, class_weights=[3,1])
+        
         bs = 1
-        train_loader = get_dataloader(x_train, id_train, class_train, train=True, batch_size=bs, img_size=(res,res,res), sample_weight=None, num_workers=12)
-        val_loader = get_dataloader(x_val, id_val, class_val, train=True, batch_size=bs, img_size=(res,res,res), sample_weight=None, num_workers=12)
+        train_loader = get_dataloader(x_train, id_train, class_train, train=True, batch_size=bs, img_size=(res,res,res), sampler=train_sampler, num_workers=12)
+        val_loader = get_dataloader(x_val, id_val, class_val, train=True, batch_size=bs, img_size=(res,res,res), sampler=val_sampler, num_workers=12)
 
         dataloader = {"train":train_loader, "val":val_loader}
         # model.load_state_dict(torch.load("/root/code/pg_hvae/runs/2023-11-20_12-45-37/models/model1-classifier.pth"))

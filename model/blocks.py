@@ -17,10 +17,11 @@ class Upsample(nn.Module):
         self.mode = mode
         self.scale_factor = scale_factor
         self.size = size
-        self.conv_1 = nn.Conv3d(n_channels, n_out, 3, stride=1, padding=1, bias=False, dilation=1)
+        self.n_out = n_out
+        self.conv_1 = nn.Conv3d(n_channels, n_out, 3, stride=1, padding='same', bias=False, dilation=1)
 
     def forward(self, x):
-        x = nn.functional.interpolate(x, size=self.size, scale_factor=self.scale_factor, mode=self.mode,
+        x = nn.functional.interpolate(x, scale_factor=self.scale_factor, mode=self.mode,
                                          align_corners=self.align_corners)
         return self.conv_1(x)
 
@@ -44,6 +45,8 @@ class BlockEncoder(nn.Module):
 
         self.se = SEBlock3D(n_channels, reduction_ratio=4)
         self.output_channels = n_channels
+        
+        self.linear = nn.Linear(in_features=n_channels, out_features=n_channels)
 
     def forward(self, x):
         """
@@ -74,7 +77,7 @@ class BlockDecoder(nn.Module):
         self.with_se = with_se
 
         hidden_dim = int(round(n_channels * ex))
-
+        
         self.norm0 = nn.InstanceNorm3d(n_channels, eps=1e-5, momentum=0.05)
         self.conv0 = nn.Conv3d(n_channels, hidden_dim, 3, stride=1, padding='same', bias=True, dilation=1)
 
@@ -219,7 +222,6 @@ class AsFeatureMap_down(nn.Module):
         x = self.linear(x)
         return x
     
-
 class ResnetBlock(nn.Module):
     def __init__(self, dim: int, padding_type: str="replicate", norm_layer: bool=True, use_dropout: bool=True, use_bias: bool=True):
         super(ResnetBlock, self).__init__()
@@ -286,6 +288,74 @@ class BlockFinalImg(nn.Module):
         out = self.convt3(out)
         out = self.act_last(out)
         return out
+    
+# class ResnetBlock(nn.Module):
+#     def __init__(self, dim: int, padding_type: str="replicate", norm_layer: bool=True, use_dropout: bool=True, use_bias: bool=True):
+#         super(ResnetBlock, self).__init__()
+        
+#         self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
+    
+#     def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
+#         conv_block = []
+        
+#         conv_block += [
+#             nn.Conv3d(dim, dim, kernel_size=3, padding="same", padding_mode=padding_type, bias=use_bias),
+#             nn.ReLU(True)
+#         ]
+
+#         # Optional dropout layer
+#         if use_dropout:
+#             conv_block += [nn.Dropout(0.5)]
+
+#         # Another convolutional layer with optional bias
+#         conv_block += [
+#             nn.Conv3d(dim, dim, kernel_size=3, padding="same", padding_mode=padding_type, bias=use_bias)
+#         ]
+
+#         if norm_layer:
+#             conv_block += [nn.InstanceNorm3d(dim)]
+#         return nn.Sequential(*conv_block)
+    
+#     def forward(self, x):
+#         out = x + self.conv_block(x)  # Add skip connection
+#         return out
+
+
+
+# class BlockFinalImg(nn.Module):
+#     def __init__(self, n_channels: int=3, n_out: int=64, last_act: str='tanh') -> None:
+#         super().__init__()
+
+#         self.res = nn.Sequential(
+#             ResnetBlock(n_channels, padding_type='reflect', norm_layer=nn.InstanceNorm3d, use_dropout=False, use_bias=True),
+#             ResnetBlock(n_channels, padding_type='reflect', norm_layer=nn.InstanceNorm3d, use_dropout=False, use_bias=True),
+#             ResnetBlock(n_channels, padding_type='reflect', norm_layer=nn.InstanceNorm3d, use_dropout=False, use_bias=True),
+#             ResnetBlock(n_channels, padding_type='reflect', norm_layer=nn.InstanceNorm3d, use_dropout=False, use_bias=True),
+#             ResnetBlock(n_channels, padding_type='reflect', norm_layer=nn.InstanceNorm3d, use_dropout=False, use_bias=True),
+#             ResnetBlock(n_channels, padding_type='reflect', norm_layer=nn.InstanceNorm3d, use_dropout=False, use_bias=True),
+#         )
+#         # print(self.res, 'res')
+
+#         self.convt2 = nn.Conv3d(in_channels=n_channels, out_channels=n_channels, kernel_size=7, padding="same", padding_mode='reflect')
+#         self.norm2 = nn.InstanceNorm3d(n_channels)
+#         self.act = nn.LeakyReLU(0.2, True)
+#         self.convt3 = nn.Conv3d(in_channels=n_channels, out_channels=n_out, kernel_size=7, padding="same", padding_mode='reflect')
+
+#         if last_act=='tanh':
+#             self.act_last = nn.Tanh()
+#         else:
+#             self.act_last = nn.Identity()
+    
+#     def forward(self, x):
+#         print(x.shape,'in bfi')
+#         out = self.res(x)
+
+#         out = self.convt2(out)
+#         out = self.norm2(out)
+#         out = self.act(out)
+#         out = self.convt3(out)
+#         out = self.act_last(out)
+#         return out
 
 
 if __name__ == "__main__":

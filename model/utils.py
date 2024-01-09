@@ -49,6 +49,32 @@ class SEBlock3D(nn.Module):
         return out
 
 
+class ConsistentOutputShape3DLayer(nn.Module):
+    def __init__(self, min_output_shape):
+        super(ConsistentOutputShape3DLayer, self).__init__()
+        self.min_output_shape = min_output_shape
+
+    def forward(self, x):
+        # Get the current shape of the input tensor
+        input_shape = x.size()
+
+        # Determine how much padding or trimming is needed
+        pad_shape = [max(0, min_shape - curr_shape) for min_shape, curr_shape in zip(self.min_output_shape, input_shape)]
+        # trim_shape = [max(0, curr_shape - min_shape) for min_shape, curr_shape in zip(self.min_output_shape, input_shape)]
+        
+        print(pad_shape, "pad shape")
+
+        # Apply padding if needed
+        if any(pad_shape):
+            x = nn.functional.pad(x, (0, pad_shape[4], 0, pad_shape[3], 0, pad_shape[2], 0, pad_shape[1], 0, pad_shape[0]))
+
+        # # Apply trimming if needed
+        # if any(trim_shape):
+        #     x = x[:, :, :trim_shape[1], :trim_shape[2], :trim_shape[3]]
+
+        return x
+
+
 def soft_clamp(x: torch.Tensor, v: int=10):
     return x.div(v).tanh_().mul(v)
 
